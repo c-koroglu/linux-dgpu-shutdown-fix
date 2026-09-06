@@ -1,0 +1,87 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+# This file is executed by update-grub. Most of it is ordinary shell code, but
+# the heredoc at the end prints a GRUB menu entry to stdout. update-grub places
+# that output in grub.cfg, where GRUB interprets it during a later boot.
+
+# Load GRUB's helper functions for translating Linux paths and locating the
+# filesystem from which the kernel and initramfs will be read.
+prefix=/usr
+exec_prefix=/usr
+datarootdir=/usr/share
+. "$pkgdatadir/grub-mkconfig_lib"
+
+# Fail closed by emitting no menu entry unless the installed override exists,
+# has the checksum recorded at build time, and the normal Linux boot device is
+# known. Exiting successfully lets the rest of update-grub continue normally.
+payload=/boot/s5fix-acpi.cpio
+[ -f "$payload" ] || exit 0
+[ "$(sha256sum "$payload" | cut -d ' ' -f 1)" = '@PAYLOAD_SHA@' ] || exit 0
+[ -n "${GRUB_DEVICE_UUID:-}" ] || exit 0
+[ -n "${GRUB_DEVICE_BOOT:-}" ] || exit 0
+
+# Select the newest generic kernel for which a matching initramfs exists.
+latest=
+for kernel in /boot/vmlinuz-*-generic; do
+    [ -f "$kernel" ] || continue
+    version=${kernel#/boot/vmlinuz-}
+    [ -f "/boot/initrd.img-$version" ] || continue
+    if [ -z "$latest" ] || dpkg --compare-versions "$version" gt "$latest"; then
+        latest=$version
+    fi
+done
+[ -n "$latest" ] || exit 0
+
+# Convert Linux filenames into paths GRUB can use on the boot filesystem. The
+# access snippet may contain commands needed for GRUB to reach that filesystem.
+kernel=$(make_system_path_relative_to_its_root "/boot/vmlinuz-$latest")
+initrd=$(make_system_path_relative_to_its_root "/boot/initrd.img-$latest")
+payload=$(make_system_path_relative_to_its_root "$payload")
+access=$(prepare_grub_to_access_device "$GRUB_DEVICE_BOOT")
+title=$(printf '%s with ACPI dGPU shutdown fix' "${GRUB_DISTRIBUTOR:-Linux}" | grub_quote)
+
+# Everything between EOF markers is emitted as GRUB code. Shell variables such
+# as kernel and payload expand now; escaped dollar signs remain for GRUB to
+# evaluate at boot.
+cat <<EOF
+menuentry '$title' --class gnu-linux --class os --id 's5fix' {
+	# Reproduce the normal Linux entry's display and saved-selection behavior.
+	recordfail
+	savedefault
+	load_video
+	set gfxpayload=\$linux_gfx_mode
+$access
+	# Start the selected kernel with the normal Ubuntu kernel arguments.
+	linux $kernel root=UUID=$GRUB_DEVICE_UUID ro ${GRUB_CMDLINE_LINUX:-} ${GRUB_CMDLINE_LINUX_DEFAULT:-}
+
+	# Read the current firmware identity directly at boot. These values must all
+	# match the machine from which this ACPI override was built.
+	insmod smbios
+	smbios --type 0 --get-string 5 --set s5_bios
+	smbios --type 1 --get-string 4 --set s5_vendor
+	smbios --type 1 --get-string 5 --set s5_product
+	smbios --type 2 --get-string 5 --set s5_board
+	set s5_ok=0
+	if [ "\$s5_vendor" = '@SYS_VENDOR@' ]; then
+		if [ "\$s5_product" = '@PRODUCT_NAME@' ]; then
+			if [ "\$s5_board" = '@BOARD_NAME@' ]; then
+				if [ "\$s5_bios" = '@BIOS_VERSION@' ]; then
+					set s5_ok=1
+				fi
+			fi
+		fi
+	fi
+
+	if [ "\$s5_ok" = 1 ]; then
+		# Load the override first, followed by the ordinary Linux initramfs.
+		initrd $payload $initrd
+	else
+		# A mismatch safely boots Linux without applying the override.
+		echo 'Firmware mismatch; loading the normal initramfs.'
+		initrd $initrd
+		sleep 3
+	fi
+}
+EOF

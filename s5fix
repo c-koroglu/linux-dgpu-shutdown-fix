@@ -1,0 +1,1060 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent
+BUILD = ROOT / "build/output"
+ACPI_TABLES = Path("/sys/firmware/acpi/tables")
+PCI_DEVICES = Path("/sys/bus/pci/devices")
+DMI_FIELDS = ("sys_vendor", "product_name", "board_name", "bios_version")
+
+# These are the system files owned by an installed copy of s5fix.
+PAYLOAD = Path("/boot/s5fix-acpi.cpio")
+GENERATOR = Path("/etc/grub.d/40_s5fix")
+DEFAULTS = Path("/etc/default/grub.d/50-s5fix.cfg")
+STATE = Path("/var/lib/s5fix/manifest.json")
+
+VENDORS = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
+# Linux 3.6.8 backported the PCI core's unconditional runtime resume before
+# driver shutdown; the behavior remains in the current upstream kernel.
+LATE_PCI_RESUME_SINCE = (3, 6, 8)
+
+
+class Failure(Exception):
+    """An expected problem that should be shown without a Python traceback."""
+
+
+@dataclass(frozen=True)
+class Gpu:
+    """A display adapter and the firmware namespace that represents it."""
+
+    address: str
+    vendor: str
+    device: str
+    acpi_path: str
+    boot_vga: bool
+
+    @property
+    def description(self) -> str:
+        """Return a short, user-facing description of the adapter."""
+        maker = VENDORS.get(self.vendor, self.vendor)
+        return f"{self.address}  {maker} device {self.device}"
+
+
+@dataclass(frozen=True)
+class Block:
+    """One named ASL block and its resolved place in the ACPI namespace."""
+
+    kind: str
+    name: str
+    start: int
+    opening: int
+    closing: int
+    path: tuple[str, ...]
+
+
+def sha256(path: Path) -> str:
+    """Return the hexadecimal SHA-256 digest of ``path``."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run(command: list[str], cwd: Path | None = None) -> str:
+    """Run ``command`` and return its combined output, or raise ``Failure``."""
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    output = result.stdout + result.stderr
+    if result.returncode:
+        raise Failure(f"$ {' '.join(command)}\n{output.strip()}")
+    return output
+
+
+def machine_identity() -> dict[str, str]:
+    """Read the laptop and firmware identifiers exposed by Linux."""
+    root = Path("/sys/class/dmi/id")
+    return {name: (root / name).read_text().strip() for name in DMI_FIELDS}
+
+
+def table_names(source: Path) -> list[str]:
+    """List the DSDT and numbered SSDTs in firmware order."""
+    names = [
+        path.name
+        for path in source.iterdir()
+        if path.name == "DSDT" or re.fullmatch(r"SSDT\d*", path.name)
+    ]
+    names.sort(key=lambda name: [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)])
+    if "DSDT" not in names:
+        raise Failure(f"no DSDT was found in {source}")
+    return names
+
+
+def capture_tables(source: Path, destination: Path, names: list[str] | None = None) -> None:
+    """Copy ACPI tables from ``source`` into the empty ``destination``.
+
+    ``names`` may limit the capture to a known-safe subset such as the DSDT.
+    Linux commonly makes the table files root-only. In that case a tightly
+    scoped ``sudo tar`` command reads them; the rest of the build stays
+    unprivileged.
+    """
+    destination.mkdir(parents=True)
+    names = names or table_names(source)
+    if os.access(source / "DSDT", os.R_OK):
+        for name in names:
+            shutil.copyfile(source / name, destination / name)
+    else:
+        command = ["sudo", "tar", "--dereference", "-C", str(source), "-cf", "-", *names]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            message = result.stderr.decode(errors="replace").strip()
+            raise Failure(f"could not read the protected ACPI tables\n{message}")
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            members = {member.name: member for member in archive.getmembers()}
+            if set(members) != set(names) or not all(member.isfile() for member in members.values()):
+                raise Failure("sudo returned an unexpected ACPI-table archive")
+            for name in names:
+                extracted = archive.extractfile(members[name])
+                if extracted is None:
+                    raise Failure(f"could not extract {name}")
+                (destination / name).write_bytes(extracted.read())
+    (destination / "dmi.json").write_text(json.dumps(machine_identity(), indent=2) + "\n")
+
+
+def copy_tables(source: Path, destination: Path) -> None:
+    """Copy a previously captured table set into ``destination``."""
+    destination.mkdir(parents=True)
+    for name in table_names(source):
+        shutil.copyfile(source / name, destination / name)
+    identity = source / "dmi.json"
+    if identity.is_file():
+        shutil.copyfile(identity, destination / "dmi.json")
+    else:
+        (destination / "dmi.json").write_text(json.dumps(machine_identity(), indent=2) + "\n")
+
+
+def read_attribute(path: Path) -> str:
+    """Read a one-line sysfs attribute, returning an empty string if absent."""
+    try:
+        return path.read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return ""
+
+
+def display_adapters(root: Path = PCI_DEVICES) -> list[Gpu]:
+    """Return PCI display adapters that have a usable ACPI namespace path."""
+    adapters = []
+    for device in sorted(root.iterdir()):
+        if not read_attribute(device / "class").startswith("0x03"):
+            continue
+        acpi_path = read_attribute(device / "firmware_node/path")
+        if not acpi_path:
+            continue
+        adapters.append(
+            Gpu(
+                address=device.name,
+                vendor=read_attribute(device / "vendor"),
+                device=read_attribute(device / "device"),
+                acpi_path=acpi_path,
+                boot_vga=read_attribute(device / "boot_vga") == "1",
+            )
+        )
+    return adapters
+
+
+def choose_gpu(requested: str | None, root: Path = PCI_DEVICES) -> Gpu:
+    """Select the non-primary GPU, using a PCI address only when necessary."""
+    candidates = [gpu for gpu in display_adapters(root) if not gpu.boot_vga]
+    if requested:
+        short = requested.removeprefix("0000:")
+        matches = [gpu for gpu in candidates if gpu.address.removeprefix("0000:") == short]
+        if len(matches) == 1:
+            return matches[0]
+        choices = "\n".join(f"  {gpu.description}" for gpu in candidates) or "  (none)"
+        raise Failure(f"{requested} is not a non-primary display adapter. Choices:\n{choices}")
+    if len(candidates) == 1:
+        return candidates[0]
+    choices = "\n".join(f"  {gpu.description}" for gpu in candidates) or "  (none)"
+    if not candidates:
+        raise Failure("no non-primary GPU with an ACPI path was found")
+    raise Failure(
+        f"more than one possible discrete GPU was found:\n{choices}\n"
+        "Run diagnose again with --gpu ADDRESS"
+    )
+
+
+def assess_shutdown_risk(
+    gpu: Gpu, root: Path = PCI_DEVICES, kernel: str | None = None
+) -> dict:
+    """Collect the observable signs of the late-dGPU-wake problem.
+
+    ``gpu`` is the adapter selected by discovery. ``root`` is its PCI sysfs
+    directory (replaceable by tests), and ``kernel`` defaults to the running
+    kernel release. The result is stored in the build manifest so a user can
+    see why the diagnosis was made.
+
+    A nonzero runtime-suspend counter proves that Linux has suspended the GPU
+    during this boot even when an application is using it at diagnosis time.
+    Linux has resumed PCI devices during shutdown since 3.6.8; vendor kernels
+    can differ, so this is strong evidence rather than a claim of certainty.
+    """
+    device = root / gpu.address
+    suspended = read_attribute(device / "power/runtime_suspended_time")
+    release = kernel or os.uname().release
+    version = tuple(int(part) for part in re.findall(r"\d+", release)[:3])
+    version += (0,) * (3 - len(version))
+    try:
+        driver = (device / "driver").resolve(strict=True).name
+    except FileNotFoundError:
+        driver = "none"
+
+    evidence = {
+        "kernel": release,
+        "kernel_has_late_pci_resume": version >= LATE_PCI_RESUME_SINCE,
+        "hybrid_graphics": any(adapter.boot_vga for adapter in display_adapters(root)),
+        "driver": driver,
+        "runtime_pm_enabled": read_attribute(device / "power/control") == "auto",
+        "runtime_suspended": suspended.isdigit() and int(suspended) > 0,
+        "d3cold_allowed": read_attribute(device / "d3cold_allowed") == "1",
+        "current_power_state": read_attribute(device / "power_state") or "unknown",
+    }
+    strong = (
+        evidence["kernel_has_late_pci_resume"]
+        and evidence["hybrid_graphics"]
+        and evidence["runtime_pm_enabled"]
+        and evidence["runtime_suspended"]
+        and evidence["d3cold_allowed"]
+    )
+    evidence["confidence"] = "high" if strong else "incomplete"
+    return evidence
+
+
+def mask_asl(text: str) -> str:
+    """Blank ASL strings and comments while preserving character positions."""
+    masked = list(text)
+    index = 0
+    state = "code"
+    while index < len(text):
+        pair = text[index : index + 2]
+        if state == "code" and pair == "//":
+            masked[index] = masked[index + 1] = " "
+            index += 2
+            state = "line"
+            continue
+        if state == "code" and pair == "/*":
+            masked[index] = masked[index + 1] = " "
+            index += 2
+            state = "block"
+            continue
+        if state == "code" and text[index] == '"':
+            masked[index] = " "
+            index += 1
+            state = "string"
+            continue
+        if state == "line":
+            if text[index] == "\n":
+                state = "code"
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if state == "block":
+            if pair == "*/":
+                masked[index] = masked[index + 1] = " "
+                index += 2
+                state = "code"
+            else:
+                if text[index] != "\n":
+                    masked[index] = " "
+                index += 1
+            continue
+        if state == "string":
+            if text[index] == "\\" and index + 1 < len(text):
+                masked[index] = masked[index + 1] = " "
+                index += 2
+            elif text[index] == '"':
+                masked[index] = " "
+                index += 1
+                state = "code"
+            else:
+                if text[index] != "\n":
+                    masked[index] = " "
+                index += 1
+            continue
+        index += 1
+    return "".join(masked)
+
+
+def matching(source: str, opening: int, left: str, right: str) -> int:
+    """Return the closing delimiter paired with ``source[opening]``."""
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == left:
+            depth += 1
+        elif source[index] == right:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise Failure(f"unbalanced {left}{right} delimiters in decompiled ACPI source")
+
+
+def canonical_name(name: str) -> tuple[str, ...]:
+    """Normalize an ASL namespace name for reliable comparisons."""
+    return tuple(part.rstrip("_") for part in name.lstrip("\\").split(".") if part)
+
+
+def resolve_name(name: str, parent: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve an absolute or relative ASL name beneath ``parent``."""
+    if name.startswith("\\"):
+        return canonical_name(name)
+    while name.startswith("^"):
+        parent = parent[:-1]
+        name = name[1:]
+    return parent + canonical_name(name)
+
+
+def named_blocks(text: str) -> list[Block]:
+    """Find Scope, Device, and Method blocks and resolve their full names."""
+    masked = mask_asl(text)
+    pattern = re.compile(r"\b(Scope|Device|Method)\s*\(\s*([\\^A-Za-z0-9_.]+)")
+    blocks: list[Block] = []
+    for match in pattern.finditer(masked):
+        paren = masked.find("(", match.start(), match.end())
+        arguments_end = matching(masked, paren, "(", ")")
+        opening = arguments_end + 1
+        while opening < len(masked) and masked[opening].isspace():
+            opening += 1
+        if opening >= len(masked) or masked[opening] != "{":
+            continue
+        closing = matching(masked, opening, "{", "}")
+        parents = [
+            block
+            for block in blocks
+            if block.kind in ("Scope", "Device") and block.opening < match.start() < block.closing
+        ]
+        parent = max(parents, key=lambda block: block.opening).path if parents else ()
+        blocks.append(
+            Block(
+                match.group(1),
+                match.group(2),
+                match.start(),
+                opening,
+                closing,
+                resolve_name(match.group(2), parent),
+            )
+        )
+    return blocks
+
+
+def asl_path(path: tuple[str, ...]) -> str:
+    """Render a normalized namespace tuple as an absolute ASL path."""
+    return "\\" + ".".join(path)
+
+
+def literal_value(text: str) -> int | None:
+    """Convert a simple ASL integer literal to an integer."""
+    values = {"Zero": 0, "One": 1, "Ones": 0xFFFFFFFFFFFFFFFF}
+    if text in values:
+        return values[text]
+    try:
+        return int(text, 0)
+    except ValueError:
+        return None
+
+
+def if_blocks(text: str, method: Block) -> list[tuple[int, int, str]]:
+    """Return ``(opening, closing, condition)`` for If blocks in ``method``."""
+    masked = mask_asl(text)
+    found = []
+    for match in re.finditer(r"\bIf\s*\(", masked[method.opening : method.closing]):
+        start = method.opening + match.start()
+        paren = masked.find("(", start, method.closing)
+        condition_end = matching(masked, paren, "(", ")")
+        opening = condition_end + 1
+        while opening < method.closing and masked[opening].isspace():
+            opening += 1
+        if opening < method.closing and masked[opening] == "{":
+            found.append((opening, matching(masked, opening, "{", "}"), masked[paren + 1 : condition_end]))
+    return found
+
+
+def simple_equality(condition: str) -> tuple[str, int] | None:
+    """Parse ``NAME == INTEGER`` (with optional extra parentheses)."""
+    token = r"(?:Zero|One|Ones|0x[0-9A-Fa-f]+|[0-9]+)"
+    name = r"[A-Za-z_][A-Za-z0-9_]{0,3}"
+    condition = condition.strip()
+    while condition.startswith("(") and condition.endswith(")"):
+        condition = condition[1:-1].strip()
+    match = re.fullmatch(rf"({name})\s*==\s*({token})", condition)
+    if not match:
+        match = re.fullmatch(rf"({token})\s*==\s*({name})", condition)
+        if not match:
+            return None
+        value = literal_value(match.group(1))
+        return (match.group(2), value) if value is not None else None
+    value = literal_value(match.group(2))
+    return (match.group(1), value) if value is not None else None
+
+
+def find_poweroff_strategy(sources: dict[str, str], gpu_path: str) -> dict:
+    """Find a narrowly recognizable firmware method that powers off the dGPU.
+
+    ``sources`` maps decompiled table filenames to their ASL text. ``gpu_path``
+    is the GPU's absolute ACPI namespace path, obtained from Linux sysfs.
+
+    The supported forms call an ``_OFF`` method directly from the GPU's
+    zero-argument ``_PS3`` method. The call may be unconditional, or guarded by
+    one non-boolean command latch that ``_PS3`` resets afterward. Ambiguous
+    logic is rejected instead of guessed at.
+
+    Return the table containing ``_PS3``, its absolute method path, and either
+    the required latch assignment or ``None`` when no latch is needed. Raise
+    ``Failure`` unless exactly one safe interpretation can be established.
+    """
+    device = canonical_name(gpu_path)
+    matches: list[tuple[str, str, Block]] = []
+    for filename, text in sources.items():
+        for block in named_blocks(text):
+            if block.kind == "Method" and block.path == device + ("_PS3",):
+                header = text[block.start : block.opening]
+                if re.search(r"Method\s*\(\s*_PS3\s*,\s*0\s*,", header):
+                    matches.append((filename, text, block))
+    if len(matches) != 1:
+        raise Failure("could not find one standard firmware power-state routine for the discrete GPU")
+
+    filename, text, method = matches[0]
+    masked = mask_asl(text)
+    off_calls = [
+        match.start()
+        for match in re.finditer(r"[\\^A-Za-z0-9_.]*_OFF\s*\(\s*\)", masked[method.opening : method.closing])
+    ]
+    off_calls = [method.opening + position for position in off_calls]
+    if not off_calls:
+        raise Failure("the GPU power-state routine does not directly switch its power rail off")
+
+    controls = if_blocks(text, method)
+    enclosing = [[item for item in controls if item[0] < call < item[1]] for call in off_calls]
+    if all(not items for items in enclosing):
+        trigger = None
+    else:
+        containers = [
+            block
+            for block in named_blocks(text)
+            if block.kind in ("Scope", "Device")
+            and block.path == device
+            and block.opening < method.start < block.closing
+        ]
+        if not containers:
+            raise Failure("could not locate the GPU power-state routine in the firmware namespace")
+        container = max(containers, key=lambda block: block.opening)
+        namespace = masked[container.opening : container.closing]
+        after_poweroff = masked[max(off_calls) : method.closing]
+        candidates: set[tuple[str, int]] = set()
+        for opening, closing, condition in controls:
+            parsed = simple_equality(condition)
+            if parsed is None or parsed[1] in (0, 1):
+                continue
+            name, expected = parsed
+            if not all(opening < call < closing for call in off_calls):
+                continue
+            declared = re.search(rf"\bName\s*\(\s*{re.escape(name)}\s*,", namespace)
+            assignments = re.findall(
+                rf"\b{re.escape(name)}\s*=\s*(Zero|One|Ones|0x[0-9A-Fa-f]+|[0-9]+)",
+                after_poweroff,
+            )
+            reset = any(literal_value(value) not in (None, expected) for value in assignments)
+            if declared and reset:
+                candidates.add((name, expected))
+        if len(candidates) != 1:
+            raise Failure("the GPU firmware's power-off conditions are ambiguous; refusing to guess")
+        name, value = candidates.pop()
+        trigger = {"object": asl_path(device + (name.rstrip("_"),)), "value": value}
+
+    return {
+        "source_table": filename.removesuffix(".dsl"),
+        "method": asl_path(device + ("_PS3",)),
+        "trigger": trigger,
+    }
+
+
+def has_shutdown_correction(text: str, strategy: dict) -> bool:
+    """Return whether ``text`` already applies ``strategy`` during S5.
+
+    ``text`` is a decompiled DSDT. ``strategy`` is the dictionary returned by
+    ``find_poweroff_strategy``.
+
+    The check is semantic rather than a file-hash comparison: it recognizes
+    the GPU power-off call and its optional enabling assignment inside the
+    ``Arg0 == 5`` branch of ``_PTS``. This also recognizes a manually built
+    version of the same correction.
+    """
+    points = [
+        block
+        for block in named_blocks(text)
+        if block.kind == "Method"
+        and block.path == ("_PTS",)
+        and re.search(r"Method\s*\(\s*_PTS\s*,\s*1\s*,", text[block.start : block.opening])
+    ]
+    if len(points) != 1:
+        return False
+
+    target_method = canonical_name(strategy["method"])
+    target_trigger = strategy["trigger"]
+    integer = r"(?:Zero|One|Ones|0x[0-9A-Fa-f]+|[0-9]+)"
+    name = r"[\\^A-Za-z0-9_.]+"
+    for opening, closing, condition in if_blocks(text, points[0]):
+        if simple_equality(condition) != ("Arg0", 5):
+            continue
+        body = mask_asl(text[opening:closing])
+        calls = re.findall(rf"({name})\s*\(\s*\)", body)
+        if target_method not in (canonical_name(call) for call in calls):
+            continue
+        if target_trigger is None:
+            return True
+
+        # iasl may print an AML Store operation using either Store(VALUE,
+        # NAME) or the easier-to-read NAME = VALUE form.
+        stores = re.findall(
+            rf"Store\s*\(\s*({integer})\s*,\s*({name})\s*\)|({name})\s*=\s*({integer})",
+            body,
+        )
+        for store_value, store_name, assignment_name, assignment_value in stores:
+            value = store_value or assignment_value
+            object_name = store_name or assignment_name
+            if (
+                canonical_name(object_name) == canonical_name(target_trigger["object"])
+                and literal_value(value) == target_trigger["value"]
+            ):
+                return True
+    return False
+
+
+def remove_invalid_externals(source: Path, compiler_output: str) -> int:
+    """Remove only decompiler-created External lines rejected as iasl error 6163."""
+    line_numbers = {
+        int(match.group(1))
+        for match in re.finditer(
+            r"^DSDT\.dsl\s+(\d+):\s+External\s*\([^\n]*\nError\s+6163\b",
+            compiler_output,
+            re.MULTILINE,
+        )
+    }
+    if not line_numbers:
+        return 0
+    lines = source.read_text().splitlines(keepends=True)
+    for number in line_numbers:
+        if number < 1 or number > len(lines) or not lines[number - 1].lstrip().startswith("External ("):
+            raise Failure("iasl reported an unsafe or unexpected source-cleanup location")
+    source.write_text("".join(line for number, line in enumerate(lines, 1) if number not in line_numbers))
+    return len(line_numbers)
+
+
+def compile_baseline(source: Path, work: Path) -> str:
+    """Compile the unmodified DSDT, cleaning only known decompiler artifacts."""
+    for _attempt in range(3):
+        result = subprocess.run(
+            ["iasl", "-tc", "-p", "stock", source.name], cwd=work, text=True, capture_output=True
+        )
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            return output
+        if not remove_invalid_externals(source, output):
+            raise Failure(f"the firmware DSDT could not be recompiled unchanged\n{compiler_errors(output)}")
+    raise Failure("the firmware DSDT still failed to compile after safe cleanup")
+
+
+def compiler_errors(log: str) -> str:
+    """Reduce a long iasl log to its error locations and final summary."""
+    lines = log.splitlines()
+    selected = []
+    for index, line in enumerate(lines):
+        if re.match(r"Error\s+\d+\b", line):
+            if index and lines[index - 1] not in selected:
+                selected.append(lines[index - 1])
+            selected.append(line)
+    selected.extend(line for line in lines if line.startswith("Compilation failed."))
+    return "\n".join(selected) or "iasl failed without reporting an error location"
+
+
+def diagnostics(log: str) -> list[tuple[str, str]]:
+    """Return the warning and remark codes emitted by iasl."""
+    return sorted(re.findall(r"\b(Warning|Remark)\s+(\d+)\b", log))
+
+
+def patch_dsdt(text: str, strategy: dict) -> str:
+    """Return DSDT source containing the shutdown correction.
+
+    ``text`` is the decompiled DSDT and ``strategy`` is the result of
+    ``find_poweroff_strategy``. The transformation raises the DSDT revision,
+    declares names supplied by another table when necessary, and adds the
+    power-off call to the final S5 branch of ``_PTS``. Unsafe or ambiguous
+    input raises ``Failure`` instead of producing a partial patch.
+    """
+    method = strategy["method"]
+    if "s5fix:" in text:
+        raise Failure("the captured DSDT already contains an s5fix correction")
+
+    # Raising the OEM revision makes Linux prefer this DSDT over the firmware
+    # copy while preserving the firmware's manufacturer and table identity.
+    definition = re.compile(
+        r"^(DefinitionBlock\s*\(.*?,\s*)(0x[0-9A-Fa-f]+|[0-9]+)(\s*\))",
+        re.MULTILINE,
+    )
+    matches = list(definition.finditer(text))
+    if len(matches) != 1:
+        raise Failure("could not identify the DSDT header")
+    revision = int(matches[0].group(2), 0)
+    if revision == 0xFFFFFFFF:
+        raise Failure("the DSDT revision cannot be increased")
+    text = definition.sub(lambda match: f"{match.group(1)}0x{revision + 1:08X}{match.group(3)}", text, count=1)
+
+    declarations = []
+    # Definitions in an SSDT are external to the DSDT being compiled. If the
+    # power method is already in the DSDT, redeclaring it would be an error.
+    if strategy["source_table"] != "DSDT":
+        declarations.append((method, "MethodObj"))
+        if strategy["trigger"]:
+            declarations.append((strategy["trigger"]["object"], "IntObj"))
+    existing = {canonical_name(name) for name in re.findall(r"\bExternal\s*\(\s*([^,\s]+)", text)}
+    additions = [
+        f"    External ({name}, {kind})"
+        for name, kind in declarations
+        if canonical_name(name) not in existing
+    ]
+    if additions:
+        header_end = text.find("\n", text.find("{", matches[0].start())) + 1
+        text = text[:header_end] + "\n".join(additions) + "\n" + text[header_end:]
+
+    # _PTS receives the requested sleep-state number. Add the call only to its
+    # S5 path, after the method's existing work and before its closing brace.
+    points = [
+        block
+        for block in named_blocks(text)
+        if block.kind == "Method"
+        and block.path == ("_PTS",)
+        and re.search(r"Method\s*\(\s*_PTS\s*,\s*1\s*,", text[block.start : block.opening])
+    ]
+    if len(points) != 1:
+        raise Failure("could not find one standard final firmware shutdown routine")
+    point = points[0]
+    point_body = mask_asl(text[point.opening : point.closing])
+    if re.search(r"\bReturn\s*\(", point_body):
+        raise Failure("the final firmware shutdown routine can return early; refusing to patch it")
+    if re.search(re.escape(method) + r"\s*\(\s*\)", point_body):
+        raise Failure("the captured DSDT already calls the dGPU power-off method during shutdown")
+    closing_line = text.rfind("\n", 0, point.closing) + 1
+    method_indent = re.match(r"[ \t]*", text[text.rfind("\n", 0, point.start) + 1 :]).group()
+    indent = method_indent + "    "
+    lines = [
+        f"{indent}/* s5fix: power off the discrete GPU at the final S5 transition. */",
+        f"{indent}If ((Arg0 == 0x05))",
+        f"{indent}{{",
+        f"{indent}    If (CondRefOf ({method}))",
+        f"{indent}    {{",
+    ]
+    if strategy["trigger"]:
+        trigger = strategy["trigger"]
+        lines.append(f"{indent}        Store (0x{trigger['value']:02X}, {trigger['object']})")
+    lines.extend(
+        [
+            f"{indent}        {method} ()",
+            f"{indent}    }}",
+            f"{indent}}}",
+            "",
+        ]
+    )
+    return text[:closing_line] + "\n".join(lines) + text[closing_line:]
+
+
+def acpi_header(path: Path) -> dict:
+    """Validate an ACPI table and return the header fields used by this build."""
+    data = path.read_bytes()
+    if len(data) < 36 or data[:4] != b"DSDT":
+        raise Failure(f"not a DSDT: {path}")
+    if struct.unpack_from("<I", data, 4)[0] != len(data) or sum(data) % 256:
+        raise Failure(f"invalid ACPI length or checksum: {path}")
+    return {
+        "oem_id": data[10:16].decode("ascii", errors="replace"),
+        "table_id": data[16:24].decode("ascii", errors="replace"),
+        "oem_revision": struct.unpack_from("<I", data, 24)[0],
+    }
+
+
+def make_cpio(aml: Path, destination: Path) -> None:
+    """Package ``aml`` at the exact early-boot path understood by Linux."""
+    tree = destination.parent / "initrd/kernel/firmware/acpi"
+    tree.mkdir(parents=True)
+    target = tree / "DSDT.aml"
+    shutil.copyfile(aml, target)
+    os.utime(target, (0, 0))
+    with destination.open("wb") as archive:
+        result = subprocess.run(
+            ["cpio", "--quiet", "--create", "--format=newc", "--owner=0:0", "--reproducible"],
+            cwd=destination.parent / "initrd",
+            input=b"kernel/firmware/acpi/DSDT.aml\n",
+            stdout=archive,
+        )
+    if result.returncode:
+        raise Failure("could not create the early-boot archive")
+    shutil.rmtree(destination.parent / "initrd")
+
+
+def verify_output(output: Path) -> dict:
+    """Verify a completed build directory and return its manifest.
+
+    ``output`` must contain the manifest, captured input tables, corrected
+    DSDT, and early-boot archive produced by ``diagnose``. Checksums bind those
+    files together, while the ACPI and archive checks reject malformed output.
+    Any failed check raises ``Failure`` before installation can use the build.
+    """
+    manifest = json.loads((output / "manifest.json").read_text())
+    if manifest.get("format") != 1:
+        raise Failure("unsupported or missing build-manifest format")
+    # Verify both generated artifacts and their original inputs. This catches
+    # accidental edits, stale files, and incomplete builds.
+    for name, digest in manifest["artifacts"].items():
+        if sha256(output / name) != digest:
+            raise Failure(f"checksum mismatch: {name}")
+    acpi_header(output / "DSDT.aml")
+    for name, digest in manifest["inputs"].items():
+        if sha256(output / "tables" / name) != digest:
+            raise Failure(f"captured table changed after the build: {name}")
+    # This build deliberately contains only one override, at the early-initrd
+    # path Linux recognizes for a replacement DSDT.
+    with (output / "s5fix-acpi.cpio").open("rb") as archive:
+        result = subprocess.run(["cpio", "--quiet", "-it"], stdin=archive, text=True, capture_output=True)
+    if result.returncode or result.stdout.strip() != "kernel/firmware/acpi/DSDT.aml":
+        raise Failure("the early-boot archive has unexpected contents")
+    return manifest
+
+
+def compiler_version() -> str:
+    """Return the installed iasl version for the build record."""
+    match = re.search(r"version (\d+)", run(["iasl", "-v"]))
+    if not match:
+        raise Failure("could not determine the iasl version")
+    return match.group(1)
+
+
+def diagnose(args) -> None:
+    """Diagnose the shutdown risk, then build and verify a local correction.
+
+    ``args.gpu`` optionally selects a non-primary PCI display adapter.
+    ``args.tables`` optionally names a previously captured set of factory ACPI
+    tables; otherwise the running tables are captured. Work is assembled in a
+    temporary directory and published to ``BUILD`` only after every check has
+    passed. The function prints the diagnosis and returns no value.
+    """
+    # Hardware discovery and live power-management state provide the evidence
+    # for the diagnosis. Firmware analysis separately determines fixability.
+    gpu = choose_gpu(args.gpu)
+    evidence = assess_shutdown_risk(gpu)
+    BUILD.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".s5fix-", dir=BUILD.parent) as temporary:
+        work = Path(temporary)
+        tables = work / "tables"
+        # Saved factory tables are useful when this boot already has a manual
+        # override. In the normal case, capture the tables Linux is using now.
+        if args.tables:
+            copy_tables(Path(args.tables).resolve(), tables)
+        else:
+            capture_tables(ACPI_TABLES, tables)
+        identity = json.loads((tables / "dmi.json").read_text())
+        if identity != machine_identity():
+            raise Failure("the saved ACPI tables came from a different machine or firmware version")
+
+        # Decompile the DSDT together with its SSDT dependencies, then scan all
+        # tables for the selected GPU's existing power-off implementation.
+        source_names = table_names(tables)
+        for name in source_names:
+            shutil.copyfile(tables / name, work / name)
+        # iasl resolves duplicate declarations in command-line order. A stable
+        # lexical order matches the conventional SSDT* shell expansion.
+        external_names = sorted(name for name in source_names if name.startswith("SSDT"))
+        decompile_command = ["iasl"]
+        if external_names:
+            decompile_command.extend(["-e", *external_names])
+        decompile_log = run([*decompile_command, "-d", "DSDT"], work)
+        scan_logs = []
+        sources = {"DSDT.dsl": (work / "DSDT.dsl").read_text()}
+        for name in external_names:
+            scan_logs.append(run(["iasl", "-d", name], work))
+            sources[f"{name}.dsl"] = (work / f"{name}.dsl").read_text()
+
+        strategy = find_poweroff_strategy(sources, gpu.acpi_path)
+
+        # When saved factory tables are used, inspect the table loaded by this
+        # boot separately. This distinguishes an affected machine from one
+        # that is affected but already protected by an ACPI override.
+        live_source = sources["DSDT.dsl"]
+        if args.tables:
+            live_tables = work / "live"
+            capture_tables(ACPI_TABLES, live_tables, ["DSDT"])
+            shutil.copyfile(live_tables / "DSDT", work / "live.aml")
+            run(["iasl", "-d", "-p", "live", "live.aml"], work)
+            live_source = (work / "live.dsl").read_text()
+        evidence["correction_active"] = has_shutdown_correction(live_source, strategy)
+
+        # A corrected live table cannot be patched a second time. Without a
+        # saved factory table there is also nothing useful to rebuild.
+        if evidence["correction_active"] and not args.tables:
+            print("Diagnosis: affected, correction already active")
+            print(f"  Dedicated GPU: {gpu.description} ({evidence['driver']} driver)")
+            print("  Current boot protected: yes")
+            print("No new correction was built; use --tables with saved factory tables to rebuild.")
+            return
+
+        # Recompile the untouched DSDT first. It is the control build used to
+        # prove that later compiler errors or warnings were caused by our edit.
+        dsl = work / "DSDT.dsl"
+        stock_log = compile_baseline(dsl, work)
+        stock_header = acpi_header(tables / "DSDT")
+        compiled_header = acpi_header(work / "stock.aml")
+        if (stock_header["oem_id"], stock_header["table_id"], stock_header["oem_revision"]) != (
+            compiled_header["oem_id"],
+            compiled_header["table_id"],
+            compiled_header["oem_revision"],
+        ):
+            raise Failure("the unchanged control build did not preserve the DSDT identity")
+
+        # Compile the corrected source and require the same warning set and
+        # firmware identity as the control, apart from the increased revision.
+        dsl.write_text(patch_dsdt(dsl.read_text(), strategy))
+        compiled = subprocess.run(
+            ["iasl", "-tc", "-p", "DSDT", "DSDT.dsl"],
+            cwd=work,
+            text=True,
+            capture_output=True,
+        )
+        patched_log = compiled.stdout + compiled.stderr
+        if compiled.returncode:
+            raise Failure(f"the generated correction did not compile\n{compiler_errors(patched_log)}")
+        if diagnostics(stock_log) != diagnostics(patched_log):
+            raise Failure("the generated correction changed the compiler warning set")
+        patched_header = acpi_header(work / "DSDT.aml")
+        if (
+            patched_header["oem_id"] != stock_header["oem_id"]
+            or patched_header["table_id"] != stock_header["table_id"]
+        ):
+            raise Failure("the generated DSDT has the wrong firmware identity")
+        if patched_header["oem_revision"] != stock_header["oem_revision"] + 1:
+            raise Failure("the generated DSDT does not have the required newer revision")
+
+        # Keep the human-readable source and logs beside the boot payload. The
+        # manifest records machine identity, reasoning, and file checksums.
+        result = work / "result"
+        result.mkdir()
+        shutil.copytree(tables, result / "tables")
+        for source, name in ((work / "DSDT.aml", "DSDT.aml"), (dsl, "DSDT.dsl")):
+            shutil.copyfile(source, result / name)
+        (result / "decompile.log").write_text(decompile_log)
+        (result / "scan.log").write_text("\n".join(scan_logs))
+        (result / "stock.log").write_text(stock_log)
+        (result / "patched.log").write_text(patched_log)
+        make_cpio(result / "DSDT.aml", result / "s5fix-acpi.cpio")
+        manifest = {
+            "format": 1,
+            "machine": identity,
+            "gpu": {
+                "address": gpu.address,
+                "vendor": gpu.vendor,
+                "device": gpu.device,
+                "acpi_path": gpu.acpi_path,
+            },
+            "diagnosis": evidence,
+            "correction": strategy,
+            "compiler": compiler_version(),
+            "inputs": {name: sha256(tables / name) for name in source_names},
+            "artifacts": {
+                "DSDT.aml": sha256(result / "DSDT.aml"),
+                "s5fix-acpi.cpio": sha256(result / "s5fix-acpi.cpio"),
+            },
+        }
+        (result / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        verify_output(result)
+        # Replace the public build only now, after the self-contained result
+        # has passed the same verification later used by installation.
+        if BUILD.exists():
+            if not BUILD.is_dir() or BUILD.is_symlink():
+                raise Failure(f"refusing to replace non-directory build output: {BUILD}")
+            shutil.rmtree(BUILD)
+        result.rename(BUILD)
+
+    likely = evidence["confidence"] == "high"
+    if evidence["correction_active"]:
+        headline = "affected, correction already active"
+    elif likely:
+        headline = "likely affected and fixable"
+    else:
+        headline = "fixable; evidence incomplete"
+    print(f"Diagnosis: {headline}")
+    print(f"  Dedicated GPU: {gpu.description} ({evidence['driver']} driver)")
+    print(f"  Hybrid graphics: {'yes' if evidence['hybrid_graphics'] else 'no'}")
+    print(f"  Runtime power management: {'enabled' if evidence['runtime_pm_enabled'] else 'disabled'}")
+    print(f"  Linux has runtime-suspended it: {'yes' if evidence['runtime_suspended'] else 'no'}")
+    print(f"  Complete GPU power-off is allowed: {'yes' if evidence['d3cold_allowed'] else 'no'}")
+    print(
+        "  Kernel has the known late PCI resume path: "
+        + ("yes" if evidence["kernel_has_late_pci_resume"] else "no")
+    )
+    print("  Firmware power-off routine: found, patched, and verified")
+    print(f"  Current boot protected: {'yes' if evidence['correction_active'] else 'no'}")
+    print(f"Correction: {BUILD}")
+    if not likely and not evidence["correction_active"]:
+        print("The correction was built, but the live checks do not support a high-confidence diagnosis.")
+
+
+def render_grub(manifest: dict) -> str:
+    """Fill the guarded GRUB-entry template from a verified manifest.
+
+    ``manifest`` is the dictionary returned by ``verify_output``. Its payload
+    checksum and machine identity become literal boot-time guards. Values are
+    restricted to a conservative character set before entering shell and GRUB
+    source. Return the rendered generator without writing system files.
+    """
+    text = (ROOT / "grub/40_s5fix.in").read_text()
+    values = {
+        "PAYLOAD_SHA": manifest["artifacts"]["s5fix-acpi.cpio"],
+        **{name.upper(): value for name, value in manifest["machine"].items()},
+    }
+    for key, value in values.items():
+        if not re.fullmatch(r"[A-Za-z0-9 ._/-]+", value):
+            raise Failure(f"unsafe value for the GRUB entry: {value!r}")
+        text = text.replace(f"@{key}@", value)
+    if re.search(r"@[A-Z_]+@", text):
+        raise Failure("the GRUB template contains an unresolved value")
+    return text
+
+
+def require_root() -> None:
+    """Reject a system-changing command unless it is running as root."""
+    if os.geteuid() != 0:
+        raise Failure("this command must be run with sudo")
+
+
+def atomic_write(path: Path, data: bytes, mode: int) -> None:
+    """Replace ``path`` atomically with ``data`` and permission bits ``mode``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.s5fix-new")
+    temporary.write_bytes(data)
+    temporary.chmod(mode)
+    temporary.replace(path)
+
+
+def install_build(change_default: bool) -> dict:
+    """Install the verified build and return its manifest.
+
+    If ``change_default`` is true, also configure GRUB to remember the last
+    menu choice. The function must run as root. It refuses builds made for a
+    different machine or firmware version and refuses to replace files that
+    look like an installation not owned by s5fix.
+    """
+    require_root()
+    # Recheck the build under root rather than trusting files verified during
+    # an earlier, possibly interrupted diagnose command.
+    manifest = verify_output(BUILD)
+    if machine_identity() != manifest["machine"]:
+        raise Failure("this build belongs to a different machine or firmware version")
+    # The running table may be either the captured factory DSDT or this exact
+    # correction. Any third value means the firmware or override has changed.
+    live_hash = sha256(ACPI_TABLES / "DSDT")
+    valid_hashes = {manifest["inputs"]["DSDT"], manifest["artifacts"]["DSDT.aml"]}
+    if live_hash not in valid_hashes:
+        raise Failure("the running DSDT is neither the build input nor this build's correction")
+    if not STATE.exists() and any(path.exists() for path in (PAYLOAD, GENERATOR, DEFAULTS)):
+        raise Failure("an unmanaged s5fix installation already exists")
+
+    # Publish complete files atomically, then regenerate and syntax-check the
+    # final GRUB configuration before reporting success.
+    atomic_write(PAYLOAD, (BUILD / "s5fix-acpi.cpio").read_bytes(), 0o644)
+    atomic_write(GENERATOR, render_grub(manifest).encode(), 0o755)
+    atomic_write(STATE, (json.dumps(manifest, indent=2) + "\n").encode(), 0o644)
+    if change_default:
+        atomic_write(DEFAULTS, b"GRUB_DEFAULT=saved\nGRUB_SAVEDEFAULT=true\n", 0o644)
+    run(["update-grub"])
+    run(["grub-script-check", "/boot/grub/grub.cfg"])
+    return manifest
+
+
+def try_once(_args) -> None:
+    """Install the correction for one boot, without rebooting the machine."""
+    install_build(change_default=False)
+    run(["grub-reboot", "s5fix"])
+    print("Installed and selected the fix for the next boot only; no reboot was requested")
+
+
+def install(_args) -> None:
+    """Install the build and make GRUB remember the last selected entry."""
+    install_build(change_default=True)
+    run(["grub-set-default", "s5fix"])
+    print("Installed the fix as the current saved GRUB choice; no reboot was requested")
+
+
+def uninstall(_args) -> None:
+    """Remove files managed by s5fix and rebuild the GRUB menu."""
+    require_root()
+    if not STATE.exists():
+        raise Failure("s5fix is not installed")
+    for path in (PAYLOAD, GENERATOR, DEFAULTS, STATE):
+        path.unlink(missing_ok=True)
+    run(["update-grub"])
+    print("Removed s5fix and rebuilt GRUB")
+
+
+def parser() -> argparse.ArgumentParser:
+    """Create the small diagnose, try, install, and uninstall interface."""
+    cli = argparse.ArgumentParser(
+        description="Diagnose and correct a dedicated GPU left powered after Linux shutdown"
+    )
+    commands = cli.add_subparsers(title="commands", dest="command", required=True)
+    command = commands.add_parser(
+        "diagnose", help="check this laptop and build a correction when its firmware is supported"
+    )
+    command.add_argument(
+        "--gpu",
+        metavar="ADDRESS",
+        help="PCI address to use only if more than one non-primary GPU is listed (for example 01:00.0)",
+    )
+    command.add_argument(
+        "--tables",
+        metavar="DIRECTORY",
+        help="use a saved ACPI-table directory instead of capturing the running firmware (advanced)",
+    )
+    command.set_defaults(function=diagnose)
+    commands.add_parser(
+        "try", help="install and select the correction for the next boot only; never reboots"
+    ).set_defaults(function=try_once)
+    commands.add_parser(
+        "install", help="keep the correction installed and remember the last GRUB choice; never reboots"
+    ).set_defaults(function=install)
+    commands.add_parser("uninstall", help="remove the correction and its GRUB entry").set_defaults(
+        function=uninstall
+    )
+    return cli
+
+
+def main() -> int:
+    """Run the selected command and print expected failures without a traceback."""
+    try:
+        args = parser().parse_args()
+        args.function(args)
+        return 0
+    except (Failure, FileNotFoundError, PermissionError, KeyError, json.JSONDecodeError) as error:
+        print(f"s5fix: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
